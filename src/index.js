@@ -1,32 +1,82 @@
-// 入口：编排 "拉取账单 → 生成日报 → 推送钉钉" 全流程。
+// 入口：编排 "拉取用量 → 聚合日报 → 推送钉钉" 全流程。
 // 真实模式使用环境变量中的密钥；--dry-run 使用内置 mock 数据并打印到控制台。
 
 import { parseArgs, loadConfig, isHttpUrl } from './config.js';
 import { computeReportDates } from './dates.js';
-import { fetchDailyUsage, fetchSpend, fetchUsageEvents } from './traeApi.js';
+import { createTraeClient } from './traeApi.js';
 import { buildMockData } from './fixtures.js';
 import { buildReportModel } from './aggregate.js';
 import { renderMarkdown, buildDingtalkPayload } from './format.js';
 import { sendToDingtalk } from './dingtalk.js';
 
+/**
+ * 获取账期起点（epoch ms）。
+ * 优先使用环境变量 BILLING_CYCLE_START_SEC，否则默认当月 1 日。
+ */
+function getCycleStartMs(config, dates) {
+  if (config.cycleStartSec) {
+    return config.cycleStartSec * 1000;
+  }
+  // 默认当月 1 日
+  const y = new Date(dates.yesterday.startMs);
+  return Date.UTC(y.getUTCFullYear(), y.getUTCMonth(), 1);
+}
+
+/**
+ * 获取数据：真实模式调用 Trae API，dry-run 返回 mock 数据。
+ */
 async function gatherData(config, dates) {
   if (config.dryRun) {
-    return buildMockData(dates);
+    const mock = buildMockData(dates);
+    return {
+      users: mock.users,
+      yesterdayUsage: mock.yesterdayUsage,
+      dayBeforeUsage: mock.dayBeforeUsage,
+      cycleUsage: mock.cycleUsage,
+      cycleStartMs: mock.cycleStartMs,
+    };
   }
-  // 真实模式：并发拉取三个端点。用量窗口覆盖 T-2..T-1。
-  const startDate = dates.dayBefore.startMs;
-  const endDate = dates.yesterday.endMs;
-  const [dailyUsage, spendResult, usageEvents] = await Promise.all([
-    fetchDailyUsage({ baseUrl: config.apiBaseUrl, apiKey: config.apiKey, startDate, endDate }),
-    fetchSpend({ baseUrl: config.apiBaseUrl, apiKey: config.apiKey }),
-    fetchUsageEvents({ baseUrl: config.apiBaseUrl, apiKey: config.apiKey, startDate, endDate }),
+
+  // 真实模式：创建 Trae 客户端，拉取用户列表和用量数据
+  const client = createTraeClient({
+    baseUrl: config.apiBaseUrl,
+    appId: config.appId,
+    appSecret: config.appSecret,
+  });
+
+  const users = await client.getUsers();
+  console.log(`[日报] 获取到 ${users.length} 名成员`);
+
+  // 时间窗口
+  const yesterdayStartSec = Math.floor(dates.yesterday.startMs / 1000);
+  const yesterdayEndSec = Math.floor(dates.yesterday.endMs / 1000);
+  const dayBeforeStartSec = Math.floor(dates.dayBefore.startMs / 1000);
+  const dayBeforeEndSec = Math.floor(dates.dayBefore.endMs / 1000);
+
+  const cycleStartMs = getCycleStartMs(config, dates);
+  const cycleStartSec = Math.floor(cycleStartMs / 1000);
+
+  // 并行拉取昨日、前日、账期用量
+  const [yesterdayUsage, dayBeforeUsage, cycleUsage] = await Promise.all([
+    client.getUserModelUsage({
+      startTime: yesterdayStartSec,
+      endTime: yesterdayEndSec,
+    }),
+    client.getUserModelUsage({
+      startTime: dayBeforeStartSec,
+      endTime: dayBeforeEndSec,
+    }),
+    client.getUserModelUsage({
+      startTime: cycleStartSec,
+      endTime: yesterdayEndSec,
+    }),
   ]);
-  return {
-    dailyUsage,
-    spend: spendResult.spend,
-    subscriptionCycleStart: spendResult.subscriptionCycleStart,
-    usageEvents,
-  };
+
+  console.log(
+    `[日报] 用量数据：昨日 ${yesterdayUsage.length} 条、前日 ${dayBeforeUsage.length} 条、账期 ${cycleUsage.length} 条`
+  );
+
+  return { users, yesterdayUsage, dayBeforeUsage, cycleUsage, cycleStartMs };
 }
 
 async function main() {
@@ -41,10 +91,11 @@ async function main() {
   const raw = await gatherData(config, dates);
   const model = buildReportModel({
     dates,
-    dailyUsage: raw.dailyUsage,
-    spend: raw.spend,
-    subscriptionCycleStart: raw.subscriptionCycleStart,
-    usageEvents: raw.usageEvents,
+    users: raw.users,
+    yesterdayUsage: raw.yesterdayUsage,
+    dayBeforeUsage: raw.dayBeforeUsage,
+    cycleUsage: raw.cycleUsage,
+    cycleStartMs: raw.cycleStartMs,
     config,
   });
 
@@ -65,7 +116,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  // 仅输出可读错误信息，不打印堆栈中的敏感数据。
   console.error(`[日报] 执行失败：${err.message}`);
   process.exit(1);
 });

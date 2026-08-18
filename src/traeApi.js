@@ -1,11 +1,57 @@
-// Trae Admin API 客户端：Bearer 认证（API Key 作为 Bearer Token）。
-// 封装日报所需的端点，统一处理分页与错误（不泄露密钥）。
+// Trae Admin API 客户端：OAuth2 认证（app_id + app_secret → access_token）。
+// 封装日报所需的端点，统一处理分页与错误。
 
-async function postJson(baseUrl, path, apiKey, body) {
+// ========== 认证 ==========
+
+/**
+ * 获取访问令牌。令牌有效期 2 小时，建议提前 5 分钟刷新。
+ * @param {string} baseUrl
+ * @param {string} appId
+ * @param {string} appSecret
+ * @returns {Promise<{accessToken: string, expire: number}>}
+ */
+async function getAccessToken(baseUrl, appId, appSecret) {
+  const res = await fetch(`${baseUrl}/openapi/v1/auth/token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ app_id: appId, app_secret: appSecret }),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`获取 access_token 失败：HTTP ${res.status} ${text}`);
+  }
+  const json = await res.json();
+  if (json.code !== 0) {
+    throw new Error(`获取 access_token 失败：code=${json.code} message=${json.message}`);
+  }
+  return { accessToken: json.access_token, expire: json.expire };
+}
+
+// ========== 通用请求封装 ==========
+
+async function traeGet(baseUrl, path, token) {
+  const res = await fetch(`${baseUrl}${path}`, {
+    method: 'GET',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+  });
+  if (!res.ok) {
+    throw new Error(`调用 ${path} 失败：HTTP ${res.status}`);
+  }
+  const json = await res.json();
+  if (json.code !== 0) {
+    throw new Error(`调用 ${path} 失败：code=${json.code} message=${json.message}`);
+  }
+  return json;
+}
+
+async function traePost(baseUrl, path, token, body) {
   const res = await fetch(`${baseUrl}${path}`, {
     method: 'POST',
     headers: {
-      Authorization: `Bearer ${apiKey}`,
+      Authorization: `Bearer ${token}`,
       'Content-Type': 'application/json',
     },
     body: JSON.stringify(body),
@@ -13,67 +59,103 @@ async function postJson(baseUrl, path, apiKey, body) {
   if (!res.ok) {
     throw new Error(`调用 ${path} 失败：HTTP ${res.status}`);
   }
-  return res.json();
+  const json = await res.json();
+  if (json.code !== 0) {
+    throw new Error(`调用 ${path} 失败：code=${json.code} message=${json.message}`);
+  }
+  return json;
 }
 
+// ========== 业务接口 ==========
+
 /**
- * 拉取指定时间窗口内所有成员的每日用量（自动翻页）。
- * 返回数据包含 product 字段区分 Trae IDE / Trae Work。
+ * 查询成员列表（支持分页）。
+ * @returns {Promise<Array>} 成员列表
  */
-export async function fetchDailyUsage({ baseUrl, apiKey, startDate, endDate, pageSize = 1000 }) {
+export async function fetchUsers({ baseUrl, token, pageSize = 100 }) {
   const all = [];
   let page = 1;
   for (;;) {
-    const json = await postJson(baseUrl, '/teams/daily-usage-data', apiKey, {
-      startDate,
-      endDate,
-      page,
-      pageSize,
-    });
-    all.push(...(json.data || []));
-    const p = json.pagination;
-    if (!p || !p.hasNextPage) break;
+    const json = await traeGet(baseUrl, `/openapi/v1/users?page=${page}&page_size=${pageSize}`, token);
+    const items = json.data?.items || [];
+    all.push(...items);
+    const pagination = json.data?.pagination;
+    if (!pagination || page >= pagination.total_pages) break;
     page += 1;
   }
   return all;
 }
 
 /**
- * 拉取当前账期的成员消费（自动翻页），返回消费明细与账期起点。
+ * 查询指定时间范围内成员在各模型中的用量。
+ * 自动翻页，支持按 emails 或 user_ids 筛选。
+ * @param {object} opts
+ * @param {string} opts.baseUrl
+ * @param {string} opts.token
+ * @param {number} opts.startTime Unix 秒时间戳
+ * @param {number} opts.endTime Unix 秒时间戳
+ * @param {string[]} [opts.emails] 成员邮箱列表（最多 100 个）
+ * @param {string[]} [opts.userIds] 成员用户 ID 列表（最多 100 个）
+ * @returns {Promise<Array>} [{ email, model_usage: [...] }]
  */
-export async function fetchSpend({ baseUrl, apiKey, pageSize = 100 }) {
-  const spend = [];
-  let page = 1;
-  let subscriptionCycleStart = null;
-  for (;;) {
-    const json = await postJson(baseUrl, '/teams/spend', apiKey, { page, pageSize });
-    spend.push(...(json.teamMemberSpend || []));
-    if (subscriptionCycleStart == null) subscriptionCycleStart = json.subscriptionCycleStart;
-    const totalPages = json.totalPages || 1;
-    if (page >= totalPages) break;
-    page += 1;
-  }
-  return { spend, subscriptionCycleStart };
+export async function fetchUserModelUsage({ baseUrl, token, startTime, endTime, emails, userIds }) {
+  const all = [];
+  const body = { start_time: startTime, end_time: endTime };
+  if (emails && emails.length > 0) body.emails = emails;
+  if (userIds && userIds.length > 0) body.user_ids = userIds;
+
+  const json = await traePost(baseUrl, '/openapi/v1/statistics/user-model-usage', token, body);
+  all.push(...(json.data?.items || []));
+  return all;
 }
 
 /**
- * 拉取指定时间窗口内的用量事件（自动翻页），用于按天费用、Token 与模型结构。
- * 事件中包含 product 字段标识 Trae IDE / Trae Work。
+ * 按 Session ID 查询用量明细。
+ * @param {object} opts
+ * @param {string[]} opts.sessionIds 会话 ID 列表（最多 100 个）
+ * @returns {Promise<Array>}
  */
-export async function fetchUsageEvents({ baseUrl, apiKey, startDate, endDate, pageSize = 1000 }) {
-  const events = [];
-  let page = 1;
-  for (;;) {
-    const json = await postJson(baseUrl, '/teams/filtered-usage-events', apiKey, {
-      startDate,
-      endDate,
-      page,
-      pageSize,
+export async function fetchSessionUsageDetail({ baseUrl, token, sessionIds }) {
+  const json = await traePost(baseUrl, '/openapi/v1/statistics/session_usage_detail', token, {
+    session_ids: sessionIds,
+  });
+  return json.data?.items || [];
+}
+
+// ========== 高层封装（供 index.js 使用） ==========
+
+/**
+ * 创建带自动刷新令牌的 Trae API 客户端。
+ * 内部管理 token 生命周期（提前 5 分钟刷新）。
+ */
+export function createTraeClient({ baseUrl, appId, appSecret }) {
+  let tokenPromise = null;
+  let tokenExpireAt = 0;
+
+  async function ensureToken() {
+    const now = Date.now();
+    // 提前 5 分钟刷新
+    if (tokenPromise && now < tokenExpireAt - 5 * 60 * 1000) {
+      return tokenPromise;
+    }
+    tokenPromise = getAccessToken(baseUrl, appId, appSecret).then(({ accessToken, expire }) => {
+      tokenExpireAt = now + expire * 1000;
+      return accessToken;
     });
-    events.push(...(json.usageEvents || []));
-    const p = json.pagination;
-    if (!p || !p.hasNextPage) break;
-    page += 1;
+    return tokenPromise;
   }
-  return events;
+
+  return {
+    /** 获取成员列表 */
+    async getUsers() {
+      const token = await ensureToken();
+      return fetchUsers({ baseUrl, token });
+    },
+
+    /** 获取指定时间范围内成员模型用量 */
+    async getUserModelUsage({ startTime, endTime, emails, userIds }) {
+      const token = await ensureToken();
+      return fetchUserModelUsage({ baseUrl, token, startTime, endTime, emails, userIds });
+    },
+  };
 }

@@ -23,16 +23,18 @@ export function parseArgs(argv = process.argv.slice(2)) {
 
 /**
  * 读取运行配置。
- * dry-run 模式下允许缺省密钥；真实模式下缺省密钥会抛出可读错误（不含密钥内容）。
+ * dry-run 模式下允许缺省密钥；真实模式下缺省密钥会抛出可读错误。
  */
 export function loadConfig({ dryRun }) {
-  const apiKey = process.env.TRAE_ADMIN_API_KEY || '';
+  const appId = process.env.TRAE_APP_ID || '';
+  const appSecret = process.env.TRAE_APP_SECRET || '';
   const dingtalkWebhook = process.env.DINGTALK_WEBHOOK || '';
   const dingtalkSecret = process.env.DINGTALK_SECRET || '';
 
   if (!dryRun) {
     const missing = [];
-    if (!apiKey) missing.push('TRAE_ADMIN_API_KEY');
+    if (!appId) missing.push('TRAE_APP_ID');
+    if (!appSecret) missing.push('TRAE_APP_SECRET');
     if (!dingtalkWebhook) missing.push('DINGTALK_WEBHOOK');
     if (missing.length > 0) {
       throw new Error(
@@ -51,23 +53,30 @@ export function loadConfig({ dryRun }) {
       ? 1
       : Number(suggestionWeekdayRaw);
 
-  // 部门映射：从环境变量 DEPT_MAPPING 解析，JSON 格式 key=邮箱 value=部门名
+  // 部门映射（可选）：仅当 API 未返回部门字段时作为兜底
   let deptMapping = {};
   const deptRaw = process.env.DEPT_MAPPING;
   if (deptRaw) {
     try {
       deptMapping = JSON.parse(deptRaw);
     } catch {
-      console.warn('[config] DEPT_MAPPING 解析失败，将使用默认值（未分配部门）。');
+      console.warn('[config] DEPT_MAPPING 解析失败，将使用默认值。');
     }
   }
 
+  // 账期起点：Unix 秒时间戳，用于计算账期进度。可通过环境变量覆盖
+  const cycleStartSec = process.env.BILLING_CYCLE_START_SEC
+    ? Number(process.env.BILLING_CYCLE_START_SEC)
+    : null;
+
   return {
     dryRun,
-    apiKey,
+    appId,
+    appSecret,
     dingtalkWebhook,
     dingtalkSecret,
     deptMapping,
+    cycleStartSec,
     // 团队时区：日报统计日为北京时间 T-1
     timeZone: process.env.REPORT_TIMEZONE || 'Asia/Shanghai',
     // 异常高消耗：最低金额门槛（美元/日），默认 50；未超过则不告警
@@ -77,6 +86,6 @@ export function loadConfig({ dryRun }) {
     // 相对阈值：超过「昨日有花费成员均值」的倍数，默认 3
     alertAvgMultiplier: Number(process.env.ALERT_AVG_MULTIPLIER || 3),
     suggestionWeekday: Number.isFinite(suggestionWeekday) ? suggestionWeekday : 1,
-    apiBaseUrl: process.env.TRAE_API_BASE_URL || 'https://api.trae.ai',
+    apiBaseUrl: process.env.TRAE_API_BASE_URL || 'https://console.enterprise.trae.cn',
   };
 }

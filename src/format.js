@@ -11,7 +11,7 @@ function dod(p) {
 
 function tokensH(t) {
   const m = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(2)}M` : n >= 1e3 ? `${(n / 1e3).toFixed(1)}K` : `${n}`);
-  return `总 ${m(t.total)}（入 ${m(t.input)} / 出 ${m(t.output)} / 缓存读 ${m(t.cacheRead)}）`;
+  return `总 ${m(t.total)}（入 ${m(t.input)} / 出 ${m(t.output)}）`;
 }
 
 /**
@@ -21,7 +21,7 @@ export function renderMarkdown(model) {
   const { header, cost, members, deptRanking, usage, suggestions } = model;
   const lines = [];
 
-  lines.push(`# 📊 ${header.title}`);
+  lines.push(`# ${header.title}`);
   lines.push('');
   lines.push(`> 统计日（T-1）：**${header.statDay}** ｜ 账期起：${header.cycleStartYmd}`);
   lines.push(`> 数据时间戳：${header.generatedAtIso}`);
@@ -35,12 +35,6 @@ export function renderMarkdown(model) {
   lines.push(`- 昨日花费：**${usd(cost.yesterdayUsd)}**，环比前日 ${dod(cost.spendDodPct)}（前日 ${usd(cost.dayBeforeUsd)}）`);
   lines.push(`- 日均：${usd(cost.avgDailyUsd)}（账期已过 ${cost.cycleProgress.elapsedDays}/${cost.cycleProgress.totalDays} 天）`);
   lines.push(`- 预估期末：**${usd(cost.projectedCycleEndUsd)}**`);
-  lines.push('');
-
-  // 产品拆分
-  lines.push('#### 昨日产品拆分');
-  lines.push(`- Trae IDE：${usd(cost.yIdeUsd)}`);
-  lines.push(`- Trae Work：${usd(cost.yWorkUsd)}`);
   lines.push('');
 
   // ===== 二、成员排行 =====
@@ -77,7 +71,9 @@ export function renderMarkdown(model) {
 
   // ===== 四、用量结构 =====
   lines.push('## 四、用量结构');
-  lines.push(`- 昨日请求：**${int(usage.yesterdayRequests)}**，环比 ${dod(usage.reqDodPct)}`);
+  if (usage.yesterdayRequests != null) {
+    lines.push(`- 昨日请求：**${int(usage.yesterdayRequests)}**，环比 ${dod(usage.reqDodPct)}`);
+  }
   lines.push(`- 昨日 Token：${tokensH(usage.tokens)}`);
   if (usage.topModels.length > 0) {
     const models = usage.topModels.map((m, i) => `${i + 1}）${m.model}（${usd(m.usd)}）`).join('；');

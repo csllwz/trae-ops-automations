@@ -17,7 +17,8 @@ jobs:
           node-version: 20
       - name: 执行日报
         env:
-          TRAE_ADMIN_API_KEY: ${{ secrets.TRAE_ADMIN_API_KEY }}
+          TRAE_APP_ID: ${{ secrets.TRAE_APP_ID }}
+          TRAE_APP_SECRET: ${{ secrets.TRAE_APP_SECRET }}
           DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
           DINGTALK_SECRET: ${{ secrets.DINGTALK_SECRET }}
           DEPT_MAPPING: ${{ secrets.DEPT_MAPPING }}

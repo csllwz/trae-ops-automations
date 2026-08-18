@@ -3,32 +3,63 @@
 
 import { cycleProgress } from './dates.js';
 
-const centsToUsd = (cents) => Math.round((Number(cents) || 0)) / 100;
+/** 将金额字符串解析为浮点数（Trae API 返回 "1.500000" 格式） */
+function parseAmount(val) {
+  const n = Number(val);
+  return Number.isFinite(n) ? n : 0;
+}
 
 function pct(curr, prev) {
   if (!prev) return null;
   return (curr - prev) / prev;
 }
 
-function sumEventsCharged(events) {
-  return events.reduce((acc, e) => acc + (Number(e.chargedCents) || 0), 0);
+/**
+ * 从 user-model-usage 条目中提取成员总费用（所有模型合计）。
+ * @returns {{ totalUsd: number, basicUsd: number, payGoUsd: number }}
+ */
+function memberTotalUsd(item) {
+  let basic = 0;
+  let payGo = 0;
+  for (const mu of item.model_usage || []) {
+    if (mu.amount) {
+      basic += parseAmount(mu.amount.basic_amount);
+      payGo += parseAmount(mu.amount.pay_go_amount);
+    }
+  }
+  return { totalUsd: basic + payGo, basicUsd: basic, payGoUsd: payGo };
 }
 
-function memberOverallCents(s) {
-  const overall = Number(s.overallSpendCents);
-  if (Number.isFinite(overall) && overall > 0) return overall;
-  return (Number(s.spendCents) || 0) + (Number(s.includedSpendCents) || 0);
+/**
+ * 从 user-model-usage 条目中提取 Token 总量。
+ */
+function memberTokens(item) {
+  let input = 0;
+  let output = 0;
+  for (const mu of item.model_usage || []) {
+    if (mu.usage) {
+      input += mu.usage.input_tokens || 0;
+      output += mu.usage.output_tokens || 0;
+    }
+  }
+  return { input, output };
 }
 
-function eventsInWindow(events, { startMs, endMs }) {
-  return events.filter((e) => {
-    const ts = Number(e.timestamp);
-    return ts >= startMs && ts <= endMs;
-  });
-}
-
-function usageInDay(dailyUsage, ymd) {
-  return dailyUsage.filter((u) => u.day === ymd);
+/**
+ * 从 user-model-usage 全量数据中汇总各模型费用。
+ */
+function sumByModel(usageList) {
+  const map = new Map();
+  for (const item of usageList) {
+    for (const mu of item.model_usage || []) {
+      const name = mu.model_name || '未知模型';
+      const usd = mu.amount ? parseAmount(mu.amount.total_amount) : 0;
+      map.set(name, (map.get(name) || 0) + usd);
+    }
+  }
+  return [...map.entries()]
+    .map(([model, usd]) => ({ model, usd }))
+    .sort((a, b) => b.usd - a.usd);
 }
 
 /**
@@ -58,172 +89,152 @@ function buildSpendAlerts(yesterdayMembers, config) {
 
 /**
  * 构建部门用量排行。
- * @param {Array} spend 账期成员消费明细
- * @param {Array} yEvents 昨日用量事件
- * @param {Map} nameByEmail 邮箱→姓名映射
- * @param {object} deptMapping 邮箱→部门配置映射
+ * @param {Array} users 成员列表
+ * @param {Array} yesterdayUsage 昨日用量
+ * @param {Array} cycleUsage 账期用量
+ * @param {object} deptMapping 邮箱→部门配置映射（兜底）
  */
-function buildDeptRanking(spend, yEvents, nameByEmail, deptMapping) {
-  // 先从成员数据中获取部门，优先 API 返回的 department 字段，其次配置映射
+function buildDeptRanking(users, yesterdayUsage, cycleUsage, deptMapping) {
+  // 邮箱→部门映射（优先 API 返回的 department，其次配置映射）
   const emailToDept = new Map();
-  for (const s of spend) {
-    const dept = s.department || deptMapping[s.email] || '未分配';
-    emailToDept.set(s.email, dept);
-  }
-
-  // 账期按部门汇总
-  const deptCycle = new Map();
-  for (const s of spend) {
-    const dept = emailToDept.get(s.email) || '未分配';
-    const prev = deptCycle.get(dept) || { usd: 0, memberCount: 0 };
-    deptCycle.set(dept, {
-      usd: prev.usd + centsToUsd(memberOverallCents(s)),
-      memberCount: prev.memberCount + 1,
-    });
+  for (const u of users) {
+    emailToDept.set(u.email, u.department || deptMapping[u.email] || '未分配');
   }
 
   // 昨日按部门汇总
   const deptYesterday = new Map();
-  const yUsdByEmail = new Map();
-  for (const e of yEvents) {
-    const email = e.userEmail || '未知';
-    yUsdByEmail.set(email, (yUsdByEmail.get(email) || 0) + (Number(e.chargedCents) || 0));
-  }
-  for (const [email, cents] of yUsdByEmail) {
-    const dept = emailToDept.get(email) || '未分配';
+  for (const item of yesterdayUsage) {
+    const dept = emailToDept.get(item.email) || '未分配';
+    const usd = memberTotalUsd(item).totalUsd;
     const prev = deptYesterday.get(dept) || { usd: 0, memberCount: 0 };
     deptYesterday.set(dept, {
-      usd: prev.usd + centsToUsd(cents),
+      usd: prev.usd + usd,
       memberCount: prev.memberCount + 1,
     });
   }
 
-  // 账期排行
-  const cycleRanking = [...deptCycle.entries()]
-    .map(([dept, v]) => ({ dept, usd: v.usd, memberCount: v.memberCount }))
-    .sort((a, b) => b.usd - a.usd);
+  // 账期按部门汇总
+  const deptCycle = new Map();
+  for (const item of cycleUsage) {
+    const dept = emailToDept.get(item.email) || '未分配';
+    const usd = memberTotalUsd(item).totalUsd;
+    const prev = deptCycle.get(dept) || { usd: 0, memberCount: 0 };
+    deptCycle.set(dept, {
+      usd: prev.usd + usd,
+      memberCount: prev.memberCount + 1,
+    });
+  }
 
-  // 昨日排行
   const yesterdayRanking = [...deptYesterday.entries()]
-    .map(([dept, v]) => ({ dept, usd: v.usd, memberCount: v.memberCount }))
+    .map(([dept, v]) => ({ dept, ...v }))
     .sort((a, b) => b.usd - a.usd);
 
-  return { cycleRanking, yesterdayRanking };
+  const cycleRanking = [...deptCycle.entries()]
+    .map(([dept, v]) => ({ dept, ...v }))
+    .sort((a, b) => b.usd - a.usd);
+
+  return { yesterdayRanking, cycleRanking };
 }
 
 /**
  * 构建日报数值模型。
  * @param {object} p
  * @param {object} p.dates computeReportDates 结果
- * @param {Array}  p.dailyUsage 每日用量（覆盖 T-2..T-1）
- * @param {Array}  p.spend 账期成员消费
- * @param {number} p.subscriptionCycleStart 账期起点 epoch ms
- * @param {Array}  p.usageEvents 用量事件（覆盖 T-2..T-1）
+ * @param {Array}  p.users 成员列表
+ * @param {Array}  p.yesterdayUsage 昨日用量
+ * @param {Array}  p.dayBeforeUsage 前日用量
+ * @param {Array}  p.cycleUsage 账期总用量
+ * @param {number} p.cycleStartMs 账期起点 epoch ms
  * @param {object} p.config 运行配置
  */
-export function buildReportModel({ dates, dailyUsage, spend, subscriptionCycleStart, usageEvents, config }) {
+export function buildReportModel({ dates, users, yesterdayUsage, dayBeforeUsage, cycleUsage, cycleStartMs, config }) {
   const now = new Date(dates.generatedAtIso);
 
-  // 邮箱 → 姓名映射
+  // 邮箱→姓名映射
   const nameByEmail = new Map();
-  for (const s of spend) if (s.email) nameByEmail.set(s.email, s.name || s.email);
+  for (const u of users) {
+    nameByEmail.set(u.email, u.name || u.email);
+  }
 
   // ===== 成本总览 =====
-  const cycleOnDemandUsd = centsToUsd(spend.reduce((a, s) => a + (Number(s.spendCents) || 0), 0));
-  const cycleIncludedUsd = centsToUsd(spend.reduce((a, s) => a + (Number(s.includedSpendCents) || 0), 0));
-  const cycleOverallUsd = centsToUsd(spend.reduce((a, s) => a + memberOverallCents(s), 0));
+  let cycleOnDemandUsd = 0;
+  let cycleIncludedUsd = 0;
+  for (const item of cycleUsage) {
+    const { basicUsd, payGoUsd } = memberTotalUsd(item);
+    cycleIncludedUsd += basicUsd;
+    cycleOnDemandUsd += payGoUsd;
+  }
+  const cycleOverallUsd = cycleOnDemandUsd + cycleIncludedUsd;
 
-  const yEvents = eventsInWindow(usageEvents, dates.yesterday);
-  const dEvents = eventsInWindow(usageEvents, dates.dayBefore);
-  const yesterdayUsd = centsToUsd(sumEventsCharged(yEvents));
-  const dayBeforeUsd = centsToUsd(sumEventsCharged(dEvents));
+  let yesterdayUsd = 0;
+  for (const item of yesterdayUsage) {
+    yesterdayUsd += memberTotalUsd(item).totalUsd;
+  }
+
+  let dayBeforeUsd = 0;
+  for (const item of dayBeforeUsage) {
+    dayBeforeUsd += memberTotalUsd(item).totalUsd;
+  }
+
   const spendDodPct = pct(yesterdayUsd, dayBeforeUsd);
 
-  const { totalDays, elapsedDays } = cycleProgress(subscriptionCycleStart, now);
-  const avgDailyUsd = cycleOverallUsd / elapsedDays;
+  const { totalDays, elapsedDays } = cycleProgress(cycleStartMs, now);
+  const avgDailyUsd = elapsedDays > 0 ? cycleOverallUsd / elapsedDays : 0;
   const projectedCycleEndUsd = avgDailyUsd * totalDays;
 
-  // ===== 产品拆分：Trae IDE vs Trae Work =====
-  const yIdeUsd = centsToUsd(
-    yEvents.filter((e) => e.product === 'trae_ide').reduce((a, e) => a + (Number(e.chargedCents) || 0), 0)
-  );
-  const yWorkUsd = centsToUsd(
-    yEvents.filter((e) => e.product === 'trae_work').reduce((a, e) => a + (Number(e.chargedCents) || 0), 0)
-  );
-
   // ===== 成员排行 =====
-  const yUsdByEmail = new Map();
-  for (const e of yEvents) {
-    const email = e.userEmail || '未知';
-    yUsdByEmail.set(email, (yUsdByEmail.get(email) || 0) + (Number(e.chargedCents) || 0));
-  }
-  const yesterdayMembers = [...yUsdByEmail.entries()]
-    .map(([email, cents]) => ({ email, name: nameByEmail.get(email) || email, usd: centsToUsd(cents) }))
+  const yesterdayMembers = yesterdayUsage
+    .map((item) => ({
+      email: item.email,
+      name: nameByEmail.get(item.email) || item.email,
+      usd: memberTotalUsd(item).totalUsd,
+    }))
     .sort((a, b) => b.usd - a.usd);
   const yesterdayTop5 = yesterdayMembers.slice(0, 5);
 
-  const cycleTop5 = [...spend]
-    .map((s) => ({ email: s.email, name: s.name || s.email, usd: centsToUsd(memberOverallCents(s)) }))
-    .sort((a, b) => b.usd - a.usd)
-    .slice(0, 5);
+  const cycleMembers = cycleUsage
+    .map((item) => ({
+      email: item.email,
+      name: nameByEmail.get(item.email) || item.email,
+      usd: memberTotalUsd(item).totalUsd,
+    }))
+    .sort((a, b) => b.usd - a.usd);
+  const cycleTop5 = cycleMembers.slice(0, 5);
 
   // 昨日零活跃人数
-  const yUsage = usageInDay(dailyUsage, dates.yesterdayYmd);
-  const inactiveCount = yUsage.filter((u) => u.isActive === false).length;
-  const totalMembers = yUsage.length || spend.length;
+  const yesterdayEmails = new Set(yesterdayUsage.map((u) => u.email));
+  const inactiveCount = users.filter(
+    (u) => !yesterdayEmails.has(u.email)
+  ).length;
+  const totalMembers = users.length;
 
   // 异常高消耗告警
   const alerts = buildSpendAlerts(yesterdayMembers, config);
 
   // ===== 部门用量排行 =====
-  const deptRanking = buildDeptRanking(spend, yEvents, nameByEmail, config.deptMapping);
+  const deptRanking = buildDeptRanking(users, yesterdayUsage, cycleUsage, config.deptMapping);
 
   // ===== 用量结构 =====
-  const reqFields = ['composerRequests', 'chatRequests', 'agentRequests', 'cmdkUsages'];
-  const sumReq = (rows) => rows.reduce((a, u) => a + reqFields.reduce((s, f) => s + (Number(u[f]) || 0), 0), 0);
-  const yesterdayRequests = sumReq(yUsage);
-  const dayBeforeRequests = sumReq(usageInDay(dailyUsage, dates.dayBeforeYmd));
-  const reqDodPct = pct(yesterdayRequests, dayBeforeRequests);
-
-  const tokens = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
-  for (const e of yEvents) {
-    const t = e.tokenUsage;
-    if (!t) continue;
-    tokens.input += Number(t.inputTokens) || 0;
-    tokens.output += Number(t.outputTokens) || 0;
-    tokens.cacheRead += Number(t.cacheReadTokens) || 0;
-    tokens.cacheWrite += Number(t.cacheWriteTokens) || 0;
+  // Token 汇总
+  const tokens = { input: 0, output: 0, total: 0 };
+  for (const item of yesterdayUsage) {
+    const t = memberTokens(item);
+    tokens.input += t.input;
+    tokens.output += t.output;
   }
-  tokens.total = tokens.input + tokens.output + tokens.cacheRead + tokens.cacheWrite;
+  tokens.total = tokens.input + tokens.output;
 
-  const usdByModel = new Map();
-  for (const e of yEvents) {
-    const model = e.model || '未知';
-    usdByModel.set(model, (usdByModel.get(model) || 0) + (Number(e.chargedCents) || 0));
-  }
-  const topModels = [...usdByModel.entries()]
-    .map(([model, cents]) => ({ model, usd: centsToUsd(cents) }))
-    .sort((a, b) => b.usd - a.usd)
-    .slice(0, 3);
+  // 模型排行
+  const topModels = sumByModel(yesterdayUsage).slice(0, 3);
 
-  // ===== 行动建议 =====
-  const includeSuggestions = dates.todayWeekday === config.suggestionWeekday;
-  const suggestions = includeSuggestions
-    ? buildSuggestions({
-        spendDodPct,
-        projectedCycleEndUsd,
-        cycleOverallUsd,
-        alerts,
-        inactiveCount,
-        totalMembers,
-      })
-    : [];
+  // ===== Header =====
+  const cycleStartYmd = new Date(cycleStartMs).toISOString().slice(0, 10);
 
   return {
     header: {
-      title: 'Trae 团队用量日报',
+      title: 'TRAE 团队用量日报',
       statDay: dates.yesterdayYmd,
-      cycleStartYmd: new Date(subscriptionCycleStart).toISOString().slice(0, 10),
+      cycleStartYmd,
       generatedAtIso: dates.generatedAtIso,
     },
     cost: {
@@ -234,33 +245,24 @@ export function buildReportModel({ dates, dailyUsage, spend, subscriptionCycleSt
       dayBeforeUsd,
       spendDodPct,
       avgDailyUsd,
-      projectedCycleEndUsd,
       cycleProgress: { totalDays, elapsedDays },
-      yIdeUsd,
-      yWorkUsd,
+      projectedCycleEndUsd,
     },
-    members: { yesterdayTop5, cycleTop5, inactiveCount, totalMembers, alerts },
+    members: {
+      yesterdayTop5,
+      cycleTop5,
+      inactiveCount,
+      totalMembers,
+      alerts,
+    },
     deptRanking,
-    usage: { yesterdayRequests, dayBeforeRequests, reqDodPct, tokens, topModels },
-    suggestions,
-    includeSuggestions,
+    usage: {
+      // Trae API 暂不支持请求数统计
+      yesterdayRequests: null,
+      reqDodPct: null,
+      tokens,
+      topModels,
+    },
+    suggestions: [],
   };
-}
-
-function buildSuggestions({ spendDodPct, projectedCycleEndUsd, cycleOverallUsd, alerts, inactiveCount, totalMembers }) {
-  const out = [];
-  if (spendDodPct != null && spendDodPct >= 0.5) {
-    out.push(`昨日费用环比上涨 ${(spendDodPct * 100).toFixed(0)}%，建议核查是否有异常长会话或大模型批量调用。`);
-  }
-  if (alerts.length > 0) {
-    out.push(`有 ${alerts.length} 名成员昨日消耗偏高，建议确认用途并视情况设置每人消费上限。`);
-  }
-  if (projectedCycleEndUsd > cycleOverallUsd * 1.2 && cycleOverallUsd > 0) {
-    out.push(`按当前日均预估期末约 $${projectedCycleEndUsd.toFixed(2)}，建议关注预算并评估是否调整套餐或限额。`);
-  }
-  if (inactiveCount > 0 && inactiveCount >= totalMembers * 0.3) {
-    out.push(`昨日有 ${inactiveCount}/${totalMembers} 名成员零活跃，建议回收闲置席位或加强推广。`);
-  }
-  if (out.length === 0) out.push('各项指标平稳，无需特别关注。');
-  return out.slice(0, 3);
 }
