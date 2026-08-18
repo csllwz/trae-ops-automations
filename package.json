@@ -1,0 +1,17 @@
+{
+  "name": "trae-ops-automations",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Trae 团队运维自动化：Trae IDE / Trae Work 团队用量日报（拉取 Admin API 账单 → 生成日报 → 推送钉钉群）",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "report": "node src/index.js",
+    "report:dry": "node src/index.js --dry-run",
+    "mock:dingtalk": "node scripts/mock-dingtalk-server.js",
+    "start": "node src/index.js"
+  },
+  "license": "UNLICENSED"
+}
